@@ -1,158 +1,130 @@
-require('dotenv').config();
-const express = require('express');
-const path = require('path');
+const express   = require('express');
+const crypto    = require('crypto');
+const stripe    = require('stripe')(process.env.STRIPE_SECRET_KEY || '');
 const bodyParser = require('body-parser');
-const Stripe = require('stripe');
+const app       = express();
+const PORT      = process.env.PORT || 3000;
 
-const app = express();
-const port = process.env.PORT || 3000;
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+/* ------------------------------------------------------------------
+   Helper to verify Stripe webhooks (only used in /webhooks/stripe)
+-------------------------------------------------------------------*/
+function verifyWebhook(req, res, next) {
+  const sig = req.headers['stripe-signature'] || '';
+  const raw = req.rawBody;
 
-// Serve static demo page
-app.use(express.static(path.join(__dirname, 'public')));
-
-// JSON body parser for API routes
-app.use(bodyParser.json());
-
-// Create a PaymentIntent for ACH debit (demo)
-app.post('/create-payment-intent', async (req, res) => {
   try {
-    const { amount = 1000 } = req.body; // amount in cents
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount,
-      currency: 'usd',
-      payment_method_types: ['us_bank_account'],
-      // For real flows, create or attach a Customer and use SetupIntent when saving payment methods.
-    });
-    res.json({ client_secret: paymentIntent.client_secret });
+    stripe.webhooks.constructEvent(raw, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    next();
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error('⚠️  Webhook verification failed:', err.message);
+    res.status(400).send(`Webhook Error: ${err.message}`);
   }
-});
+}
 
-// Create a SetupIntent (to save a bank account for future debits)
-app.post('/create-setup-intent', async (req, res) => {
-  try {
-    const setupIntent = await stripe.setupIntents.create({
-      payment_method_types: ['us_bank_account']
-    });
-    res.json({ client_secret: setupIntent.client_secret });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+/* ------------------------------------------------------------------
+   Middleware
+-------------------------------------------------------------------*/
+app.use(bodyParser.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf; // keep raw body for webhook verification
   }
-});
+}));
 
-// Create a Payout (demo) — note: your Stripe account must support programmatic payouts
-app.post('/create-payout', async (req, res) => {
+/* ------------------------------------------------------------------
+   Health check
+-------------------------------------------------------------------*/
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+/* ------------------------------------------------------------------
+   1. Create a new Treasury funding source
+   ---------------------------------------------------------------
+   POST /create-fund
+   body: { amount: 7000000, currency: "usd", description: "Initial fund" }
+   returns: { fund_distribution_id }
+-------------------------------------------------------------------*/
+app.post('/create-fund', async (req, res) => {
   try {
-    const { amount = 1000 } = req.body; // cents
-    const payout = await stripe.payouts.create({
-      amount,
-      currency: 'usd'
-    });
-    res.json(payout);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    const { amount, currency, description } = req.body;
 
-// Attach a PaymentMethod to a Customer (creates customer if email provided)
-app.post('/attach-payment-method', async (req, res) => {
-  try {
-    const { payment_method_id, email } = req.body;
-    if (!payment_method_id) return res.status(400).json({ error: 'payment_method_id required' });
-
-    let customer;
-    if (email) {
-      customer = await stripe.customers.create({ email });
-    } else {
-      customer = await stripe.customers.create();
+    if (!amount || !currency) {
+      return res.status(400).json({ error: 'amount & currency required' });
     }
 
-    // Attach the payment method to the customer
-    await stripe.paymentMethods.attach(payment_method_id, { customer: customer.id });
-
-    // Optionally set as default payment method for invoices
-    await stripe.customers.update(customer.id, { invoice_settings: { default_payment_method: payment_method_id } });
-
-    res.json({ customer_id: customer.id, payment_method_id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Verify microdeposits for a saved bank account payment method
-app.post('/verify-microdeposits', async (req, res) => {
-  try {
-    const { payment_method_id, amounts } = req.body; // amounts: [32, 45]
-    if (!payment_method_id || !Array.isArray(amounts)) return res.status(400).json({ error: 'payment_method_id and amounts[] required' });
-
-    const verified = await stripe.paymentMethods.verify(payment_method_id, { amounts });
-    res.json(verified);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Create a PaymentIntent debit using a saved payment method on a customer
-app.post('/create-debit', async (req, res) => {
-  try {
-    const { amount = 1000, currency = 'usd', customer_id, payment_method_id } = req.body;
-    if (!customer_id || !payment_method_id) return res.status(400).json({ error: 'customer_id and payment_method_id required' });
-
-    const paymentIntent = await stripe.paymentIntents.create({
+    const fund = await stripe.treasury.fund_distributions.create({
       amount,
       currency,
-      customer: customer_id,
-      payment_method: payment_method_id,
-      payment_method_types: ['us_bank_account'],
-      off_session: true,
-      confirm: true
+      description: description || 'Treasury source'
     });
 
-    res.json(paymentIntent);
+    res.json({ fund_distribution_id: fund.id, account: fund.account });
   } catch (err) {
-    console.error(err);
-    // Surface Stripe errors to client for handling (e.g., requires_action)
-    res.status(500).json({ error: err.message, raw: err.raw || null });
+    console.error('❌ Error creating fund distribution:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Webhook endpoint — use raw body for signature verification
-app.post('/webhook', bodyParser.raw({ type: 'application/json' }), (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  let event;
-
+/* ------------------------------------------------------------------
+   2. Convert USD debit to USDC payout
+   ---------------------------------------------------------------
+   POST /payout-usdc
+   body: { amount_usd: 5000, source_fund_id: "fd_..." }
+   returns: { debit_id, captured_debit }
+-------------------------------------------------------------------*/
+app.post('/payout-usdc', async (req, res) => {
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    const { amount_usd, source_fund_id } = req.body;
+
+    if (!amount_usd || !source_fund_id) {
+      return res
+        .status(400)
+        .json({ error: 'amount_usd & source_fund_id required' });
+    }
+
+    // 1️⃣ Create a debit that converts from the funding source (USD)
+    //    into USDC.  The source_fund_id holds the USD balance you want to spend.
+    const debit = await stripe.treasury.debits.create({
+      amount: amount_usd,
+      currency: 'usdc',          // target currency
+      source_fund_id,           // USD treasury balance
+      description: 'One‑time USDC payout'
+    });
+
+    // 2️⃣ Capture the debit.  After capture the money is transferred to
+    //     the connected bank/treasury account that holds USDC.
+    const captured = await stripe.treasury.debits.capture(debit.id);
+
+    res.json({
+      debit_id: debit.id,
+      captured_debit: captured
+    });
   } catch (err) {
-    console.error('Webhook signature verification failed.', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    console.error('❌ Error creating USDC payout:', err);
+    res.status(500).json({ error: err.message });
   }
-
-  // Handle the event types you care about
-  switch (event.type) {
-    case 'payment_intent.succeeded':
-      console.log('PaymentIntent succeeded:', event.data.object.id);
-      // Fulfill the purchase, update order status, etc.
-      break;
-    case 'payment_intent.payment_failed':
-      console.log('PaymentIntent failed:', event.data.object.id);
-      break;
-    case 'payout.paid':
-      console.log('Payout paid:', event.data.object.id);
-      break;
-    default:
-      console.log(`Unhandled event type ${event.type}`);
-  }
-
-  res.json({ received: true });
 });
 
-app.listen(port, () => console.log(`Server running on http://localhost:${port}`));
+/* ------------------------------------------------------------------
+   3. Stripe webhook endpoint
+   ---------------------------------------------------------------
+   POST /webhooks/stripe
+   body: Stripe event (must be `treasury.debit.credited`, `treasury.debit.failed`, etc.)
+   ---------------------------------------------------*/
+app.post('/webhooks/stripe', verifyWebhook, async (req, res) => {
+  const event = req.body;
+
+  // We only care about credit events to confirm a payout succeeded
+  if (event.type === 'treasury.debit.credited') {
+    const debit = event.data.object;
+    console.log(`✅ Debit ${debit.id} credited in ${debit.currency}`);
+    // Here you could update your DB, send a notification, etc.
+  }
+
+  res.status(200).json({ received: true });
+});
+
+/* ------------------------------------------------------------------
+   Start the server
+-------------------------------------------------------------------*/
+app.listen(PORT, () => {
+  console.log(`🚀 Treasury app listening on ${PORT}`);
+});
